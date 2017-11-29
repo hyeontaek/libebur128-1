@@ -175,7 +175,7 @@ int ebur128_change_parameters(ebur128_state* st,
 
 /** \brief Set the maximum window duration.
  *
- *  Set the maximum duration that will be used for ebur128_window_loudness().
+ *  Set the maximum duration that will be used for ebur128_loudness_window().
  *  Note that this destroys the current content of the audio buffer.
  *
  *  @param st library state.
@@ -206,6 +206,29 @@ int ebur128_set_max_window(ebur128_state* st, unsigned long window);
  *    - EBUR128_ERROR_NO_CHANGE if history not changed.
  */
 int ebur128_set_max_history(ebur128_state* st, unsigned long history);
+
+/** \brief Set the bucket level.
+ *
+ *  Set the bucket level, which is the log to the base 2 of the bucket size.
+ *  Lower values allow more accurate measurement, but makes analysis slow.
+ *  Higher values lowers the measurement accuracy, but accelerates analysis.
+ *  The measurement error is noticeable when using ebur128_loudness_window()
+ *  with very small window size (e.g., several ms).
+ *  For instance, bucket level of 1 makes 2 frames share one bucket, reducing
+ *  some part of computation by half.  Lower values are helpful if
+ *  window-based functions are called repeatedly (e.g., continuous analysis).
+ *
+ *  Default is 0 (bucket size = 1 frame).
+ *
+ *  @param st library state.
+ *  @param bucket_level log to the base 2 of the bucket size.
+ *  @return
+ *    - EBUR128_SUCCESS on success.
+ *    - EBUR128_ERROR_NO_CHANGE if bucket level not changed.
+ *    - EBUR128_ERROR_INVALID_MODE if bucket level is larger than
+ *      the log to the base 2 of the current window in st.
+ */
+int ebur128_set_bucket_level(ebur128_state* st, unsigned long bucket_level);
 
 /** \brief Add frames to be processed.
  *

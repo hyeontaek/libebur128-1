@@ -42,8 +42,12 @@ typedef struct {              /* Data structure for polyphase FIR interpolator *
 struct ebur128_state_internal {
   /** Filtered audio data (used as ring buffer). */
   double* audio_data;
-  /** Size of audio_data array. */
+  /** Logical size of audio_data array. */
   size_t audio_data_frames;
+  /** Log to the base 2 of the bucket size */
+  unsigned long bucket_level;
+  /** Physical size of audio_data array */
+  size_t audio_data_buckets;
   /** Current index for audio_data. */
   size_t audio_data_index;
   /** How many frames are needed for a gating block. Will correspond to 400ms
@@ -392,18 +396,25 @@ ebur128_state* ebur128_init(unsigned int channels,
   } else {
     goto free_prev_true_peak;
   }
+  st->d->bucket_level = 0;
   st->d->audio_data_frames = st->samplerate * st->d->window / 1000;
+  /* add a gap of (1 << st->d->bucket_level) - 1 */
+  st->d->audio_data_frames += ((size_t) 1 << st->d->bucket_level) - 1;
   if (st->d->audio_data_frames % st->d->samples_in_100ms) {
     /* round up to multiple of samples_in_100ms */
     st->d->audio_data_frames = st->d->audio_data_frames
                              + st->d->samples_in_100ms
                              - (st->d->audio_data_frames % st->d->samples_in_100ms);
   }
-  st->d->audio_data = (double*) malloc(st->d->audio_data_frames *
+  /* ensure the last frame is mapped to a valid bucket */
+  st->d->audio_data_buckets = (st->d->audio_data_frames +
+                               ((size_t) 1 << st->d->bucket_level) - 1) >>
+                              st->d->bucket_level;
+  st->d->audio_data = (double*) malloc(st->d->audio_data_buckets *
                                        st->channels *
                                        sizeof(double));
   CHECK_ERROR(!st->d->audio_data, 0, free_true_peak)
-  for (j = 0; j < st->d->audio_data_frames * st->channels; ++j) {
+  for (j = 0; j < st->d->audio_data_buckets * st->channels; ++j) {
     st->d->audio_data[j] = 0.0;
   }
 
@@ -552,7 +563,12 @@ static void ebur128_filter_##type(ebur128_state* st, const type* src,          \
   static double scaling_factor =                                               \
                  -((double) (min_scale)) > (double) (max_scale) ?              \
                  -((double) (min_scale)) : (double) (max_scale);               \
-  double* audio_data = st->d->audio_data + st->d->audio_data_index;            \
+  double* audio_data = st->d->audio_data +                                     \
+                       ((st->d->audio_data_index / st->channels) >>            \
+                        st->d->bucket_level) *                                 \
+                       st->channels;                                           \
+  size_t in_bucket_offset = (st->d->audio_data_index / st->channels) &         \
+                            (((size_t) 1 << st->d->bucket_level) - 1);         \
   size_t i, c;                                                                 \
                                                                                \
   TURN_ON_FTZ                                                                  \
@@ -585,18 +601,27 @@ static void ebur128_filter_##type(ebur128_state* st, const type* src,          \
     int ci = st->d->channel_map[c] - 1;                                        \
     if (ci < 0) continue;                                                      \
     else if (ci == EBUR128_DUAL_MONO - 1) ci = 0; /*dual mono */               \
+    i = ((size_t) 1 << st->d->bucket_level) - in_bucket_offset;                \
+    i &= ((size_t) 1 << st->d->bucket_level) - 1;                              \
+    for (; i < frames; i += (size_t) 1 << st->d->bucket_level) {               \
+        audio_data[((in_bucket_offset + i) >> st->d->bucket_level) *           \
+                   st->channels + c] = 0.;                                     \
+    }                                                                          \
     for (i = 0; i < frames; ++i) {                                             \
+      double filtered_data;                                                    \
       st->d->v[ci][0] = (double) (src[i * st->channels + c] / scaling_factor)  \
                    - st->d->a[1] * st->d->v[ci][1]                             \
                    - st->d->a[2] * st->d->v[ci][2]                             \
                    - st->d->a[3] * st->d->v[ci][3]                             \
                    - st->d->a[4] * st->d->v[ci][4];                            \
-      audio_data[i * st->channels + c] =                                       \
+      filtered_data =                                                          \
                      st->d->b[0] * st->d->v[ci][0]                             \
                    + st->d->b[1] * st->d->v[ci][1]                             \
                    + st->d->b[2] * st->d->v[ci][2]                             \
                    + st->d->b[3] * st->d->v[ci][3]                             \
                    + st->d->b[4] * st->d->v[ci][4];                            \
+      audio_data[((in_bucket_offset + i) >> st->d->bucket_level) *             \
+                  st->channels + c] += filtered_data * filtered_data;          \
       st->d->v[ci][4] = st->d->v[ci][3];                                       \
       st->d->v[ci][3] = st->d->v[ci][2];                                       \
       st->d->v[ci][2] = st->d->v[ci][1];                                       \
@@ -637,29 +662,52 @@ static int ebur128_calc_gating_block(ebur128_state* st, size_t frames_per_block,
   size_t i, c;
   double sum = 0.0;
   double channel_sum;
+  int wrapped;
+  size_t first_frame_index;
+  size_t in_bucket_offset;
+  double first_bucket_weight;
+  if (st->d->audio_data_index < frames_per_block * st->channels) {
+    wrapped = 1;
+    first_frame_index = st->d->audio_data_frames -
+                        (frames_per_block - st->d->audio_data_index / st->channels);
+  } else {
+    wrapped = 0;
+    first_frame_index = st->d->audio_data_index / st->channels - frames_per_block;
+  }
+  in_bucket_offset = first_frame_index & (((size_t) 1 << st->d->bucket_level) - 1);
+  first_bucket_weight = (double) (((size_t) 1 << st->d->bucket_level) - in_bucket_offset) /
+                        (double) ((size_t) 1 << st->d->bucket_level);
   for (c = 0; c < st->channels; ++c) {
     if (st->d->channel_map[c] == EBUR128_UNUSED) {
       continue;
     }
     channel_sum = 0.0;
-    if (st->d->audio_data_index < frames_per_block * st->channels) {
-      for (i = 0; i < st->d->audio_data_index / st->channels; ++i) {
-        channel_sum += st->d->audio_data[i * st->channels + c] *
-                       st->d->audio_data[i * st->channels + c];
+    if (wrapped) {
+      if (st->d->audio_data_index / st->channels > 0) {
+        for (i = 0;
+             i <= (st->d->audio_data_index / st->channels - 1) >> st->d->bucket_level;
+             ++i) {
+          channel_sum += st->d->audio_data[i * st->channels + c];
+        }
       }
-      for (i = st->d->audio_data_frames -
-              (frames_per_block -
-               st->d->audio_data_index / st->channels);
-           i < st->d->audio_data_frames; ++i) {
-        channel_sum += st->d->audio_data[i * st->channels + c] *
-                       st->d->audio_data[i * st->channels + c];
+      i = first_frame_index >> st->d->bucket_level;
+      if (i <= (st->d->audio_data_frames - 1) >> st->d->bucket_level) {
+        channel_sum += st->d->audio_data[i * st->channels + c] * first_bucket_weight;
+        /* assumed: st->d->audio_data_frames > 0 */
+        for (++i; i <= (st->d->audio_data_frames - 1) >> st->d->bucket_level; ++i) {
+          channel_sum += st->d->audio_data[i * st->channels + c];
+        }
       }
     } else {
-      for (i = st->d->audio_data_index / st->channels - frames_per_block;
-           i < st->d->audio_data_index / st->channels;
-           ++i) {
-        channel_sum += st->d->audio_data[i * st->channels + c] *
-                       st->d->audio_data[i * st->channels + c];
+      i = first_frame_index >> st->d->bucket_level;
+      if (i <= (st->d->audio_data_index / st->channels - 1) >> st->d->bucket_level) {
+        channel_sum += st->d->audio_data[i * st->channels + c] * first_bucket_weight;
+        /* assumed: st->d->audio_data_index / st->channels > 0 */
+        for (++i;
+             i <= (st->d->audio_data_index / st->channels - 1) >> st->d->bucket_level;
+             ++i) {
+          channel_sum += st->d->audio_data[i * st->channels + c];
+        }
       }
     }
     if (st->d->channel_map[c] == EBUR128_Mp110 ||
@@ -769,17 +817,23 @@ int ebur128_change_parameters(ebur128_state* st,
     ebur128_init_filter(st);
   }
   st->d->audio_data_frames = st->samplerate * st->d->window / 1000;
+  /* add a gap of (1 << st->d->bucket_level) - 1 */
+  st->d->audio_data_frames += ((size_t) 1 << st->d->bucket_level) - 1;
   if (st->d->audio_data_frames % st->d->samples_in_100ms) {
     /* round up to multiple of samples_in_100ms */
     st->d->audio_data_frames = st->d->audio_data_frames
                              + st->d->samples_in_100ms
                              - (st->d->audio_data_frames % st->d->samples_in_100ms);
   }
-  st->d->audio_data = (double*) malloc(st->d->audio_data_frames *
+  /* ensure the last frame is mapped to a valid bucket */
+  st->d->audio_data_buckets = (st->d->audio_data_frames +
+                               ((size_t) 1 << st->d->bucket_level) - 1) >>
+                              st->d->bucket_level;
+  st->d->audio_data = (double*) malloc(st->d->audio_data_buckets *
                                        st->channels *
                                        sizeof(double));
   CHECK_ERROR(!st->d->audio_data, EBUR128_ERROR_NOMEM, exit)
-  for (j = 0; j < st->d->audio_data_frames * st->channels; ++j) {
+  for (j = 0; j < st->d->audio_data_buckets * st->channels; ++j) {
     st->d->audio_data[j] = 0.0;
   }
 
@@ -816,17 +870,23 @@ int ebur128_set_max_window(ebur128_state* st, unsigned long window)
   free(st->d->audio_data);
   st->d->audio_data = NULL;
   st->d->audio_data_frames = st->samplerate * st->d->window / 1000;
+  /* add a gap of (1 << st->d->bucket_level) - 1 */
+  st->d->audio_data_frames += ((size_t) 1 << st->d->bucket_level) - 1;
   if (st->d->audio_data_frames % st->d->samples_in_100ms) {
     /* round up to multiple of samples_in_100ms */
     st->d->audio_data_frames = st->d->audio_data_frames
                              + st->d->samples_in_100ms
                              - (st->d->audio_data_frames % st->d->samples_in_100ms);
   }
-  st->d->audio_data = (double*) malloc(st->d->audio_data_frames *
+  /* ensure the last frame is mapped to a valid bucket */
+  st->d->audio_data_buckets = (st->d->audio_data_frames +
+                               ((size_t) 1 << st->d->bucket_level) - 1) >>
+                              st->d->bucket_level;
+  st->d->audio_data = (double*) malloc(st->d->audio_data_buckets *
                                        st->channels *
                                        sizeof(double));
   CHECK_ERROR(!st->d->audio_data, EBUR128_ERROR_NOMEM, exit)
-  for (j = 0; j < st->d->audio_data_frames * st->channels; ++j) {
+  for (j = 0; j < st->d->audio_data_buckets * st->channels; ++j) {
     st->d->audio_data[j] = 0.0;
   }
 
@@ -867,6 +927,53 @@ int ebur128_set_max_history(ebur128_state* st, unsigned long history)
     st->d->st_block_list_size--;
   }
   return EBUR128_SUCCESS;
+}
+
+int ebur128_set_bucket_level(ebur128_state* st, unsigned long bucket_level)
+{
+  int errcode = EBUR128_SUCCESS;
+  size_t j;
+
+  if (bucket_level == st->d->bucket_level) {
+    return EBUR128_ERROR_NO_CHANGE;
+  }
+  if (((size_t) 1 << bucket_level) > st->d->window) {
+    return EBUR128_ERROR_INVALID_MODE;
+  }
+
+  st->d->bucket_level = bucket_level;
+  free(st->d->audio_data);
+  st->d->audio_data = NULL;
+  st->d->audio_data_frames = st->samplerate * st->d->window / 1000;
+  /* add a gap of (1 << st->d->bucket_level) - 1 */
+  st->d->audio_data_frames += ((size_t) 1 << st->d->bucket_level) - 1;
+  if (st->d->audio_data_frames % st->d->samples_in_100ms) {
+    /* round up to multiple of samples_in_100ms */
+    st->d->audio_data_frames = st->d->audio_data_frames
+                             + st->d->samples_in_100ms
+                             - (st->d->audio_data_frames % st->d->samples_in_100ms);
+  }
+  /* ensure the last frame is mapped to a valid bucket */
+  st->d->audio_data_buckets = (st->d->audio_data_frames +
+                               ((size_t) 1 << st->d->bucket_level) - 1) >>
+                              st->d->bucket_level;
+  st->d->audio_data = (double*) malloc(st->d->audio_data_buckets *
+                                       st->channels *
+                                       sizeof(double));
+  CHECK_ERROR(!st->d->audio_data, EBUR128_ERROR_NOMEM, exit)
+  for (j = 0; j < st->d->audio_data_buckets * st->channels; ++j) {
+    st->d->audio_data[j] = 0.0;
+  }
+
+  /* the first block needs 400ms of audio data */
+  st->d->needed_frames = st->d->samples_in_100ms * 4;
+  /* start at the beginning of the buffer */
+  st->d->audio_data_index = 0;
+  /* reset short term frame counter */
+  st->d->short_term_frame_counter = 0;
+
+exit:
+  return errcode;
 }
 
 static int ebur128_energy_shortterm(ebur128_state* st, double* out);
@@ -1071,7 +1178,7 @@ int ebur128_loudness_global_multiple(ebur128_state** sts, size_t size,
 static int ebur128_energy_in_interval(ebur128_state* st,
                                       size_t interval_frames,
                                       double* out) {
-  if (interval_frames > st->d->audio_data_frames) {
+  if (interval_frames > st->d->audio_data_frames - (((size_t) 1 << st->d->bucket_level) - 1)) {
     return EBUR128_ERROR_INVALID_MODE;
   }
   ebur128_calc_gating_block(st, interval_frames, out);
